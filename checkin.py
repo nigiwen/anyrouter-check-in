@@ -433,6 +433,7 @@ async def prepare_turnstile_token(account_name: str, provider_config) -> str | N
 		provider_config.domain,
 		site_key,
 		use_proxy=provider_config.use_proxy,
+		label=account_name.replace(' ', '_').lower(),
 	)
 
 
