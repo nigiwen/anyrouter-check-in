@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from urllib.parse import quote
 
@@ -236,10 +237,29 @@ async def login_with_credentials(
 		return None
 
 
+def _request_with_retry(client, method: str, url: str, *, headers: dict, attempts: int = 3):
+	"""带瞬态传输错误重试的请求：Server disconnected / 连接重置等网络抖动换新连接重试。
+
+	仅对 httpx.TransportError 重试（不重试 HTTP 状态码错误）；重试会复用同一
+	client，httpx 会自动丢弃坏连接并新建，对 GET/POST 语义无影响。
+	"""
+	for attempt in range(attempts):
+		try:
+			if method == 'POST':
+				return client.post(url, headers=headers, timeout=30)
+			return client.get(url, headers=headers, timeout=30)
+		except httpx.TransportError as exc:
+			if attempt == attempts - 1:
+				raise
+			print(f'[WARN] Transient transport error, retrying ({attempt + 1}/{attempts - 1}): {str(exc)[:60]}')
+			time.sleep(3)
+	raise AssertionError('unreachable')
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
-		response = client.get(user_info_url, headers=headers, timeout=30)
+		response = _request_with_retry(client, 'GET', user_info_url, headers=headers)
 
 		if response.status_code == 200:
 			data = response.json()
@@ -290,7 +310,7 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict, 
 	if turnstile_token:
 		# 新版 NewAPI（GoRouter 等）：签到接口要求 Cloudflare Turnstile token（一次性）
 		sign_in_url = f'{sign_in_url}?turnstile={quote(turnstile_token)}'
-	response = client.post(sign_in_url, headers=checkin_headers, timeout=30)
+	response = _request_with_retry(client, 'POST', sign_in_url, headers=checkin_headers)
 
 	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
 
