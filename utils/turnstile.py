@@ -82,8 +82,8 @@ async (sitekey) => {
 )
 
 # 获取 widget 在页面中的位置（交互模式下需要点击复选框），附带诊断信息
-# 注意：新版 Turnstile 把 iframe 放进 closed shadow root，光 DOM 查不到 iframe，
-# 但宿主 div（id 以 cf-chl-widget- 开头）在光 DOM 可见，按其矩形点击即可命中
+# 注意：新版 Turnstile 的宿主 div 无 id 属性，iframe 在其 closed shadow root 里，
+# 光 DOM 的 iframe 查询与 id 查询都找不到，只能结构化遍历容器内非零尺寸 div
 GET_WIDGET_RECT_JS = """
 () => {
 	const container = document.getElementById('__ts_container__');
@@ -96,8 +96,26 @@ GET_WIDGET_RECT_JS = """
 		containerHtml: container ? container.innerHTML.slice(0, 160) : '',
 		allIframeCount: document.querySelectorAll('iframe').length,
 		renderRet: window.__TS_RENDER_RET__ ?? null,
+		containerSelf: null,
+		containerRects: [],
 		hostRects: [],
 	};
+	if (container) {
+		const cr = container.getBoundingClientRect();
+		info.containerSelf = { x: cr.x, y: cr.y, width: cr.width, height: cr.height };
+		for (const d of container.querySelectorAll('div')) {
+			const r = d.getBoundingClientRect();
+			if (r.width >= 100 && r.height >= 30) {
+				info.containerRects.push({
+					id: d.id ? d.id.slice(0, 24) : '(no-id)',
+					x: r.x,
+					y: r.y,
+					width: r.width,
+					height: r.height,
+				});
+			}
+		}
+	}
 	const candidates = Array.from(document.querySelectorAll('iframe')).filter(
 		(f) => (f.src || '').includes('challenges.cloudflare.com') || (container && container.contains(f))
 	);
@@ -105,8 +123,7 @@ GET_WIDGET_RECT_JS = """
 		const r = f.getBoundingClientRect();
 		info.iframes.push({ src: (f.src || '').slice(0, 80), x: r.x, y: r.y, width: r.width, height: r.height });
 	}
-	// 宿主 div 与 _response 隐藏 input 都以 cf-chl-widget- 开头；
-	// 排除 input（零尺寸）和零尺寸元素，且容器内的（我们自己渲染的）优先
+	// id 检索兜底：部分版本宿主 div 带 cf-chl-widget- 前缀 id（排除 _response 隐藏 input）
 	const hosts = Array.from(document.querySelectorAll('[id^="cf-chl-widget-"]')).filter(
 		(h) => !h.id.endsWith('_response')
 	);
@@ -185,31 +202,36 @@ async def _try_click_checkbox(page) -> bool:
 	"""尝试点击 Turnstile widget 的复选框（交互模式），成功返回 True"""
 	try:
 		info = await page.evaluate(GET_WIDGET_RECT_JS)
-		# 优先点光 DOM 里能看到的 challenge iframe（旧版渲染），
-		# 否则点 widget 宿主 div（新版 iframe 在 closed shadow root 里，宿主矩形与其重合）
-		target = None
-		target_kind = ''
-		if info.get('iframes'):
-			target = info['iframes'][0]
-			target_kind = 'iframe'
-		elif info.get('hostRects'):
-			target = info['hostRects'][0]
-			target_kind = f'widget host {target.get("id", "")}'
+		# 候选按优先级合并：光 DOM challenge iframe（旧版）→ 容器内结构化 div
+		# （新版，宿主无 id）→ 带 id 宿主 → 渲染容器自身（兜底，widget 充满容器）
+		candidates: list[tuple[str, dict]] = []
+		for rect in info.get('iframes') or []:
+			candidates.append(('iframe', rect))
+		for rect in info.get('containerRects') or []:
+			candidates.append((f'widget host {rect.get("id", "")}', rect))
+		for rect in info.get('hostRects') or []:
+			candidates.append((f'widget host {rect.get("id", "")}', rect))
+		target = next(
+			((kind, rect) for kind, rect in candidates if rect.get('width') and rect.get('height')),
+			None,
+		)
+		if target is None:
+			fallback = info.get('containerSelf')
+			if fallback and fallback.get('width') and fallback.get('height'):
+				target = ('container fallback', fallback)
 		if target is None:
 			print(
-				f'[WARN] Turnstile click skipped: no widget iframe/host (all={info.get("allIframeCount")}, '
-				f'ts={info.get("hasTurnstile")}, keys={info.get("turnstileKeys")}, '
+				f'[WARN] Turnstile click skipped: no widget target (all={info.get("allIframeCount")}, '
+				f'ts={info.get("hasTurnstile")}, renderRet={info.get("renderRet")}, '
 				f'container={info.get("hasContainer")}, htmlLen={info.get("containerHtmlLen")}, '
-				f'renderRet={info.get("renderRet")}, html={info.get("containerHtml")!r})'
+				f'html={info.get("containerHtml")!r})'
 			)
 			return False
-		if not target.get('width'):
-			print(f'[WARN] Turnstile click skipped: zero-size widget {target_kind} ({target})')
-			return False
-		x = target['x'] + min(30, target['width'] / 2)
-		y = target['y'] + target['height'] / 2
+		kind, rect = target
+		x = rect['x'] + min(30, rect['width'] / 2)
+		y = rect['y'] + rect['height'] / 2
 		await page.mouse.click(x, y)
-		print(f'[INFO] Clicked Turnstile {target_kind} at ({x:.0f},{y:.0f}) for interactive challenge')
+		print(f'[INFO] Clicked Turnstile {kind} at ({x:.0f},{y:.0f}) for interactive challenge')
 		return True
 	except Exception as e:
 		print(f'[WARN] Turnstile checkbox click failed: {str(e)[:80]}')
