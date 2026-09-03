@@ -46,7 +46,8 @@ BROWSER_LIKE_HEADERS = {
 RENDER_TURNSTILE_JS = (
 	"""
 async (sitekey) => {
-	if (window.__TS_TOKEN__ !== undefined) return 'already-rendered';
+	if (window.__TS_RENDERED__) return 'already-rendered';
+	window.__TS_RENDERED__ = true;
 	window.__TS_TOKEN__ = undefined;
 	window.__TS_ERROR__ = undefined;
 	const loadScript = () => new Promise((resolve, reject) => {
@@ -75,13 +76,19 @@ async (sitekey) => {
 	% TURNSTILE_SCRIPT_URL
 )
 
-# 获取 widget iframe 在页面中的位置（交互模式下需要点击复选框）
+# 获取 widget iframe 在页面中的位置（交互模式下需要点击复选框），附带诊断信息
 GET_WIDGET_RECT_JS = """
 () => {
-	const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-	if (!iframe) return null;
-	const rect = iframe.getBoundingClientRect();
-	return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+	const info = { iframes: [], hasContainer: !!document.getElementById('__ts_container__'), hasTurnstile: !!window.turnstile };
+	const container = document.getElementById('__ts_container__');
+	const candidates = Array.from(document.querySelectorAll('iframe')).filter(
+		(f) => (f.src || '').includes('challenges.cloudflare.com') || (container && container.contains(f))
+	);
+	for (const f of candidates) {
+		const r = f.getBoundingClientRect();
+		info.iframes.push({ src: (f.src || '').slice(0, 80), x: r.x, y: r.y, width: r.width, height: r.height });
+	}
+	return info;
 }
 """
 
@@ -90,13 +97,21 @@ def is_headless_enabled() -> bool:
 	return os.getenv('CHECKIN_HEADLESS', 'true') != 'false'
 
 
+def _screenshots_dir() -> str:
+	"""截图目录：CI 下固定到 GITHUB_WORKSPACE，避免相对路径落在别的 cwd"""
+	workspace = os.getenv('GITHUB_WORKSPACE', '').strip()
+	base = workspace or os.getcwd()
+	return os.path.join(base, 'checkin_screenshots')
+
+
 def _debug_screenshot(page, label: str) -> None:
 	"""调试模式下保存截图，便于诊断 Turnstile 交互状态"""
 	if not is_debug_enabled():
 		return
 	try:
-		os.makedirs('checkin_screenshots', exist_ok=True)
-		path = f'checkin_screenshots/turnstile-{label}.png'
+		dir_path = _screenshots_dir()
+		os.makedirs(dir_path, exist_ok=True)
+		path = os.path.join(dir_path, f'turnstile-{label}.png')
 		page.screenshot(path=path)
 		print(f'[DEBUG] Turnstile screenshot saved to {path}')
 	except Exception as e:
@@ -135,13 +150,18 @@ async def fetch_turnstile_site_key(domain: str, use_proxy: bool = False) -> str 
 async def _try_click_checkbox(page) -> bool:
 	"""尝试点击 Turnstile widget 的复选框（交互模式），成功返回 True"""
 	try:
-		rect = await page.evaluate(GET_WIDGET_RECT_JS)
-		if not rect or not rect.get('width'):
+		info = await page.evaluate(GET_WIDGET_RECT_JS)
+		if not info.get('iframes'):
+			print(f'[WARN] Turnstile click skipped: no widget iframe found ({info})')
+			return False
+		rect = info['iframes'][0]
+		if not rect.get('width'):
+			print(f'[WARN] Turnstile click skipped: zero-size widget iframe ({rect})')
 			return False
 		x = rect['x'] + min(30, rect['width'] / 2)
 		y = rect['y'] + rect['height'] / 2
 		await page.mouse.click(x, y)
-		print('[INFO] Clicked Turnstile checkbox for interactive challenge')
+		print(f'[INFO] Clicked Turnstile checkbox at ({x:.0f},{y:.0f}) for interactive challenge')
 		return True
 	except Exception as e:
 		print(f'[WARN] Turnstile checkbox click failed: {str(e)[:80]}')
@@ -170,6 +190,18 @@ async def solve_turnstile_token(
 	try:
 		page = await browser.new_page()
 		await page.goto(domain, wait_until='domcontentloaded')
+		await page.wait_for_load_state('networkidle')
+		print(f'[INFO] Browser landed on {page.url} (title: {await page.title()!r})')
+
+		# Cloudflare 拦截页（"Just a moment..."）会先自解挑战再跳转，等它完成
+		title = (await page.title()).lower()
+		if 'moment' in title or 'attention' in title:
+			print('[INFO] Cloudflare interstitial detected, waiting for it to pass...')
+			try:
+				await page.wait_for_url(f'{domain}/**', timeout=30000)
+			except Exception:
+				print(f'[WARN] Still on {page.url} after interstitial wait')
+
 		await page.evaluate(RENDER_TURNSTILE_JS, site_key)
 
 		deadline = time.monotonic() + SOLVE_TIMEOUT_SECONDS
@@ -194,7 +226,7 @@ async def solve_turnstile_token(
 				next_click_at = time.monotonic() + CLICK_DELAY_SECONDS
 			await asyncio.sleep(2)
 
-		print(f'[FAILED] Turnstile solve timeout after {SOLVE_TIMEOUT_SECONDS}s (clicks={clicks})')
+		print(f'[FAILED] Turnstile solve timeout after {SOLVE_TIMEOUT_SECONDS}s (clicks={clicks}, url={page.url})')
 		_debug_screenshot(page, f'{label}-timeout')
 		return None
 	except Exception as e:
