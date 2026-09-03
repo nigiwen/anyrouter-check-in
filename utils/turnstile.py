@@ -79,7 +79,16 @@ async (sitekey) => {
 # 获取 widget iframe 在页面中的位置（交互模式下需要点击复选框），附带诊断信息
 GET_WIDGET_RECT_JS = """
 () => {
-	const info = { iframes: [], hasContainer: !!document.getElementById('__ts_container__'), hasTurnstile: !!window.turnstile };
+	const info = {
+		iframes: [],
+		hasContainer: !!document.getElementById('__ts_container__'),
+		hasTurnstile: !!window.turnstile,
+		turnstileKeys: window.turnstile ? Object.keys(window.turnstile).slice(0, 12) : [],
+		containerHtmlLen: document.getElementById('__ts_container__')
+			? document.getElementById('__ts_container__').innerHTML.length
+			: -1,
+		allIframeCount: document.querySelectorAll('iframe').length,
+	};
 	const container = document.getElementById('__ts_container__');
 	const candidates = Array.from(document.querySelectorAll('iframe')).filter(
 		(f) => (f.src || '').includes('challenges.cloudflare.com') || (container && container.contains(f))
@@ -113,7 +122,10 @@ def _debug_screenshot(page, label: str) -> None:
 		os.makedirs(dir_path, exist_ok=True)
 		path = os.path.join(dir_path, f'turnstile-{label}.png')
 		page.screenshot(path=path)
-		print(f'[DEBUG] Turnstile screenshot saved to {path}')
+		if os.path.exists(path):
+			print(f'[DEBUG] Turnstile screenshot saved to {path} ({os.path.getsize(path)} bytes)')
+		else:
+			print(f'[WARN] Turnstile screenshot MISSING after write attempt: {path}')
 	except Exception as e:
 		print(f'[WARN] Failed to save turnstile screenshot: {e}')
 
@@ -152,7 +164,11 @@ async def _try_click_checkbox(page) -> bool:
 	try:
 		info = await page.evaluate(GET_WIDGET_RECT_JS)
 		if not info.get('iframes'):
-			print(f'[WARN] Turnstile click skipped: no widget iframe found ({info})')
+			print(
+				f'[WARN] Turnstile click skipped: no widget iframe (all={info.get("allIframeCount")}, '
+				f'ts={info.get("hasTurnstile")}, keys={info.get("turnstileKeys")}, '
+				f'container={info.get("hasContainer")}, htmlLen={info.get("containerHtmlLen")})'
+			)
 			return False
 		rect = info['iframes'][0]
 		if not rect.get('width'):
@@ -190,7 +206,12 @@ async def solve_turnstile_token(
 	try:
 		page = await browser.new_page()
 		await page.goto(domain, wait_until='domcontentloaded')
-		await page.wait_for_load_state('networkidle')
+		try:
+			# SPA 会持续发请求，networkidle 可能永远达不到，短等即可
+			await page.wait_for_load_state('networkidle', timeout=8000)
+		except Exception:
+			pass
+		await asyncio.sleep(2)
 		print(f'[INFO] Browser landed on {page.url} (title: {await page.title()!r})')
 
 		# Cloudflare 拦截页（"Just a moment..."）会先自解挑战再跳转，等它完成
