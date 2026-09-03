@@ -64,38 +64,50 @@ async (sitekey) => {
 	container.id = '__ts_container__';
 	container.style.cssText = 'position:fixed;bottom:0;right:0;width:300px;height:65px;z-index:99999;';
 	document.body.appendChild(container);
-	window.turnstile.render(container, {
-		sitekey,
-		callback: (token) => { window.__TS_TOKEN__ = token; },
-		'error-callback': (code) => { window.__TS_ERROR__ = 'error-callback: ' + code; },
-		'expired-callback': () => { window.__TS_ERROR__ = 'token expired before capture'; },
-	});
-	return 'rendered';
+	try {
+		window.__TS_RENDER_RET__ = String(window.turnstile.render(container, {
+			sitekey,
+			callback: (token) => { window.__TS_TOKEN__ = token; },
+			'error-callback': (code) => { window.__TS_ERROR__ = 'error-callback: ' + code; },
+			'expired-callback': () => { window.__TS_ERROR__ = 'token expired before capture'; },
+		}));
+	} catch (e) {
+		window.__TS_RENDER_RET__ = 'render-threw: ' + (e && e.message ? e.message : String(e));
+		window.__TS_ERROR__ = window.__TS_RENDER_RET__;
+	}
+	return 'rendered: ' + window.__TS_RENDER_RET__;
 }
 """
 	% TURNSTILE_SCRIPT_URL
 )
 
-# 获取 widget iframe 在页面中的位置（交互模式下需要点击复选框），附带诊断信息
+# 获取 widget 在页面中的位置（交互模式下需要点击复选框），附带诊断信息
+# 注意：新版 Turnstile 把 iframe 放进 closed shadow root，光 DOM 查不到 iframe，
+# 但宿主 div（id 以 cf-chl-widget- 开头）在光 DOM 可见，按其矩形点击即可命中
 GET_WIDGET_RECT_JS = """
 () => {
+	const container = document.getElementById('__ts_container__');
 	const info = {
 		iframes: [],
-		hasContainer: !!document.getElementById('__ts_container__'),
+		hasContainer: !!container,
 		hasTurnstile: !!window.turnstile,
 		turnstileKeys: window.turnstile ? Object.keys(window.turnstile).slice(0, 12) : [],
-		containerHtmlLen: document.getElementById('__ts_container__')
-			? document.getElementById('__ts_container__').innerHTML.length
-			: -1,
+		containerHtmlLen: container ? container.innerHTML.length : -1,
+		containerHtml: container ? container.innerHTML.slice(0, 160) : '',
 		allIframeCount: document.querySelectorAll('iframe').length,
+		renderRet: window.__TS_RENDER_RET__ ?? null,
+		hostRects: [],
 	};
-	const container = document.getElementById('__ts_container__');
 	const candidates = Array.from(document.querySelectorAll('iframe')).filter(
 		(f) => (f.src || '').includes('challenges.cloudflare.com') || (container && container.contains(f))
 	);
 	for (const f of candidates) {
 		const r = f.getBoundingClientRect();
 		info.iframes.push({ src: (f.src || '').slice(0, 80), x: r.x, y: r.y, width: r.width, height: r.height });
+	}
+	for (const h of document.querySelectorAll('[id^="cf-chl-widget-"]')) {
+		const r = h.getBoundingClientRect();
+		info.hostRects.push({ id: h.id.slice(0, 24), x: r.x, y: r.y, width: r.width, height: r.height });
 	}
 	return info;
 }
@@ -113,15 +125,15 @@ def _screenshots_dir() -> str:
 	return os.path.join(base, 'checkin_screenshots')
 
 
-def _debug_screenshot(page, label: str) -> None:
-	"""调试模式下保存截图，便于诊断 Turnstile 交互状态"""
+async def _debug_screenshot(page, label: str) -> None:
+	"""调试模式下保存截图，便于诊断 Turnstile 交互状态（页面来自 launch_async，必须 await）"""
 	if not is_debug_enabled():
 		return
 	try:
 		dir_path = _screenshots_dir()
 		os.makedirs(dir_path, exist_ok=True)
 		path = os.path.join(dir_path, f'turnstile-{label}.png')
-		page.screenshot(path=path)
+		await page.screenshot(path=path)
 		if os.path.exists(path):
 			print(f'[DEBUG] Turnstile screenshot saved to {path} ({os.path.getsize(path)} bytes)')
 		else:
@@ -163,21 +175,31 @@ async def _try_click_checkbox(page) -> bool:
 	"""尝试点击 Turnstile widget 的复选框（交互模式），成功返回 True"""
 	try:
 		info = await page.evaluate(GET_WIDGET_RECT_JS)
-		if not info.get('iframes'):
+		# 优先点光 DOM 里能看到的 challenge iframe（旧版渲染），
+		# 否则点 widget 宿主 div（新版 iframe 在 closed shadow root 里，宿主矩形与其重合）
+		target = None
+		target_kind = ''
+		if info.get('iframes'):
+			target = info['iframes'][0]
+			target_kind = 'iframe'
+		elif info.get('hostRects'):
+			target = info['hostRects'][0]
+			target_kind = f'widget host {target.get("id", "")}'
+		if target is None:
 			print(
-				f'[WARN] Turnstile click skipped: no widget iframe (all={info.get("allIframeCount")}, '
+				f'[WARN] Turnstile click skipped: no widget iframe/host (all={info.get("allIframeCount")}, '
 				f'ts={info.get("hasTurnstile")}, keys={info.get("turnstileKeys")}, '
-				f'container={info.get("hasContainer")}, htmlLen={info.get("containerHtmlLen")})'
+				f'container={info.get("hasContainer")}, htmlLen={info.get("containerHtmlLen")}, '
+				f'renderRet={info.get("renderRet")}, html={info.get("containerHtml")!r})'
 			)
 			return False
-		rect = info['iframes'][0]
-		if not rect.get('width'):
-			print(f'[WARN] Turnstile click skipped: zero-size widget iframe ({rect})')
+		if not target.get('width'):
+			print(f'[WARN] Turnstile click skipped: zero-size widget {target_kind} ({target})')
 			return False
-		x = rect['x'] + min(30, rect['width'] / 2)
-		y = rect['y'] + rect['height'] / 2
+		x = target['x'] + min(30, target['width'] / 2)
+		y = target['y'] + target['height'] / 2
 		await page.mouse.click(x, y)
-		print(f'[INFO] Clicked Turnstile checkbox at ({x:.0f},{y:.0f}) for interactive challenge')
+		print(f'[INFO] Clicked Turnstile {target_kind} at ({x:.0f},{y:.0f}) for interactive challenge')
 		return True
 	except Exception as e:
 		print(f'[WARN] Turnstile checkbox click failed: {str(e)[:80]}')
@@ -239,7 +261,7 @@ async def solve_turnstile_token(
 				return token
 			if state.get('error'):
 				print(f'[FAILED] Turnstile reported error: {state["error"]}')
-				_debug_screenshot(page, f'{label}-error')
+				await _debug_screenshot(page, f'{label}-error')
 				return None
 			if time.monotonic() >= next_click_at and clicks < MAX_CLICKS:
 				if await _try_click_checkbox(page):
@@ -248,11 +270,11 @@ async def solve_turnstile_token(
 			await asyncio.sleep(2)
 
 		print(f'[FAILED] Turnstile solve timeout after {SOLVE_TIMEOUT_SECONDS}s (clicks={clicks}, url={page.url})')
-		_debug_screenshot(page, f'{label}-timeout')
+		await _debug_screenshot(page, f'{label}-timeout')
 		return None
 	except Exception as e:
 		print(f'[FAILED] Error occurred while solving Turnstile: {str(e)[:100]}')
-		_debug_screenshot(page, f'{label}-exception')
+		await _debug_screenshot(page, f'{label}-exception')
 		return None
 	finally:
 		await browser.close()
