@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from urllib.parse import quote
 
 if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
@@ -37,6 +38,7 @@ from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
+from utils.turnstile import fetch_turnstile_site_key, solve_turnstile_token
 
 load_dotenv()
 
@@ -277,7 +279,7 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 	return {**waf_cookies, **user_cookies}
 
 
-def execute_check_in(client, account_name: str, provider_config, headers: dict):
+def execute_check_in(client, account_name: str, provider_config, headers: dict, turnstile_token: str | None = None):
 	"""执行签到请求"""
 	print(f'[NETWORK] {account_name}: Executing check-in')
 
@@ -285,6 +287,9 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 	checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
 
 	sign_in_url = f'{provider_config.domain}{provider_config.sign_in_path}'
+	if turnstile_token:
+		# 新版 NewAPI（GoRouter 等）：签到接口要求 Cloudflare Turnstile token（一次性）
+		sign_in_url = f'{sign_in_url}?turnstile={quote(turnstile_token)}'
 	response = client.post(sign_in_url, headers=checkin_headers, timeout=30)
 
 	print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
@@ -362,11 +367,13 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	# 邮箱密码优先
+	# 认证方式优先级：访问令牌 > 邮箱密码 > session cookies
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
-	if account.has_login_credentials():
+	if account.has_access_token():
+		auth_method = 'access token (PAT)'
+	elif account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
 		assert account.email is not None and account.password is not None
 		login_result = await login_with_credentials(
@@ -391,10 +398,16 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
-	if not all_cookies:
+	if not all_cookies and not account.has_access_token():
 		return False, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
+
+	turnstile_token = None
+	if provider_config.turnstile and provider_config.needs_manual_check_in():
+		turnstile_token = await prepare_turnstile_token(account_name, provider_config)
+		if not turnstile_token:
+			return False, None, None
 
 	return run_check_in_requests(
 		all_cookies,
@@ -402,17 +415,36 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		account_name,
 		provider_config,
 		api_user_override=resolved_api_user,
+		access_token=account.access_token if account.has_access_token() else None,
+		turnstile_token=turnstile_token,
+		use_proxy=provider_config.use_proxy,
+	)
+
+
+async def prepare_turnstile_token(account_name: str, provider_config) -> str | None:
+	"""为开启了 Turnstile 的 provider 获取一次性签到 token"""
+	site_key = provider_config.turnstile_site_key
+	if not site_key:
+		site_key = await fetch_turnstile_site_key(provider_config.domain, use_proxy=provider_config.use_proxy)
+	if not site_key:
+		print(f'[FAILED] {account_name}: Turnstile site key unavailable from {provider_config.domain}')
+		return None
+	return await solve_turnstile_token(
+		provider_config.domain,
+		site_key,
 		use_proxy=provider_config.use_proxy,
 	)
 
 
 def run_check_in_requests(
-	all_cookies: dict,
+	all_cookies: dict | None,
 	account: AccountConfig,
 	account_name: str,
 	provider_config,
 	*,
 	api_user_override: str | None = None,
+	access_token: str | None = None,
+	turnstile_token: str | None = None,
 	use_proxy: bool = False,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
@@ -429,7 +461,7 @@ def run_check_in_requests(
 			print(f'[WARN] {account_name}: Provider requires proxy but CHECKIN_PROXY_URL is not set')
 
 		with httpx.Client(**client_kwargs) as client:
-			client.cookies.update(all_cookies)
+			client.cookies.update(all_cookies or {})
 
 			headers = {
 				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
@@ -448,6 +480,10 @@ def run_check_in_requests(
 			if api_user:
 				headers[provider_config.api_user_key] = api_user
 
+			if access_token:
+				# 新版 NewAPI（GoRouter 等）：Authorization: Bearer 认证
+				headers['Authorization'] = f'Bearer {access_token}'
+
 			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 			user_info_before = get_user_info(client, headers, user_info_url)
 			if user_info_before and user_info_before.get('success'):
@@ -456,7 +492,7 @@ def run_check_in_requests(
 				print(user_info_before.get('error', 'Unknown error'))
 
 			if provider_config.needs_manual_check_in():
-				success = execute_check_in(client, account_name, provider_config, headers)
+				success = execute_check_in(client, account_name, provider_config, headers, turnstile_token)
 				user_info_after = get_user_info(client, headers, user_info_url)
 				return success, user_info_before, user_info_after
 

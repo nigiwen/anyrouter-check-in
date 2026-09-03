@@ -267,8 +267,90 @@
 
 **重要提示**：
 
-- `PROVIDERS` 是可选的，不配置则使用内置的 `anyrouter` 和 `agentrouter`
+- `PROVIDERS` 是可选的，不配置则使用内置的 `anyrouter`、`agentrouter` 和 `gorouter`
 - 自定义的 provider 配置会覆盖同名的默认配置
+
+## 新版 NewAPI / GoRouter 接入
+
+[GoRouter](https://gorouter.app/) 等运行**新版 NewAPI** 的站点重构了认证体系：旧的
+`session` cookie 与 `new-api-user` 请求头已废弃（旧 session cookie 会被服务端直接拒绝），
+改为「系统访问令牌 + 短期 Bearer token」模型，且签到接口改为 `POST /api/user/checkin`，
+并要求 Cloudflare Turnstile 人机验证。
+
+**接入步骤**：
+
+1. 登录站点控制台，在「个人设置」中生成**系统访问令牌**（access token）
+2. 账号配置使用 `provider: "gorouter"` 与 `access_token` 字段：
+
+```json
+[
+  {
+    "name": "GoRouter账号",
+    "provider": "gorouter",
+    "access_token": "你的访问令牌"
+  }
+]
+```
+
+3. 运行签到即可。脚本会自动完成整个流程：
+
+```
+PAT 认证（Authorization: Bearer）
+  → 查询签到前余额
+  → 无头浏览器打开站点页面，自动解决 Turnstile 拿到一次性 token
+  → POST /api/user/checkin?turnstile=<token> 签到
+  → 查询签到后余额
+```
+
+**注意事项**：
+
+- PAT 账号无需配置 cookies / api_user，是独立的第三类认证方式（优先级：访问令牌 > 邮箱密码 > session cookies）
+- Turnstile token 一次性有效（约 5 分钟）且绑定提交 IP；脚本在**同一台机器**上先解验证再签到，
+  本地与 GitHub Actions（浏览器与 HTTP 同一 runner）均满足。需要本机已安装 CloakBrowser（CI 已内置安装步骤）
+- Turnstile 站点密钥自动从站点 `/api/status` 读取，站点换密钥无需改配置；也可通过 `PROVIDERS`
+  覆盖 `turnstile_site_key`
+- 重复签到会返回「今日已签到」，脚本按成功处理
+- 自建新版 NewAPI 站点可通过 `PROVIDERS` 指定 `domain`：
+
+```json
+{
+  "mysite": {
+    "domain": "https://my-newapi.example.com",
+    "sign_in_path": "/api/user/checkin",
+    "turnstile": true
+  }
+}
+```
+
+### 新版 NewAPI 过渡版本（v1.0.0-rc.x，如 Huan API）
+
+介于经典版与最新版之间的站点（如 `ai.huan666.de`）：PAT 认证可用，但**必须同时携带
+`New-Api-User: <用户ID>` 请求头**；签到接口为 `/api/user/checkin`；部分站点 Turnstile 关闭
+（无需浏览器）。此类站点通过 `PROVIDERS` 自定义即可，无需改代码：
+
+```json
+{
+  "huan666": {
+    "domain": "https://ai.huan666.de",
+    "sign_in_path": "/api/user/checkin",
+    "turnstile": false
+  }
+}
+```
+
+账号配置同时提供 `access_token` 与 `api_user`（站点控制台个人中心可见，或 F12 → Network →
+任意 `/api/` 请求的 `New-Api-User` 请求头）：
+
+```json
+[
+  {
+    "name": "HuanAPI",
+    "provider": "huan666",
+    "access_token": "你的访问令牌",
+    "api_user": "10670"
+  }
+]
+```
 
 ## 代理配置（可选）
 

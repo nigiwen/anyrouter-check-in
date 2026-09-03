@@ -13,3 +13,13 @@ balance_hash.txt
 checkin_screenshots
 
 .DS_Store
+
+# 本地实测密钥与缓存（勿提交）
+gorouter_cookie*.txt
+gorouter_pat.txt
+gorouter_turnstile.txt
+.cloakbrowser-cache/
+.pytest-tmp/
+.tmp-probe/
+
+pytest-cache-files-*/

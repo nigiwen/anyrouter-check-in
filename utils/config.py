@@ -23,6 +23,10 @@ class ProviderConfig:
 	waf_cookie_names: List[str] | None = None
 	use_proxy: bool = False
 	persist_profile: bool = False
+	# 新版 NewAPI（如 GoRouter）：签到接口需要 Cloudflare Turnstile token，
+	# 由无头浏览器自动解决后以 ?turnstile= 附加到签到请求
+	turnstile: bool = False
+	turnstile_site_key: str | None = None
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -50,6 +54,8 @@ class ProviderConfig:
 		"""
 		default_use_proxy = defaults.use_proxy if defaults else False
 		default_persist_profile = defaults.persist_profile if defaults else False
+		default_turnstile = defaults.turnstile if defaults else False
+		default_turnstile_site_key = defaults.turnstile_site_key if defaults else None
 		return cls(
 			name=name,
 			domain=data['domain'],
@@ -61,6 +67,8 @@ class ProviderConfig:
 			waf_cookie_names=data.get('waf_cookie_names', defaults.waf_cookie_names if defaults else None),
 			use_proxy=data.get('use_proxy', default_use_proxy),
 			persist_profile=data.get('persist_profile', default_persist_profile),
+			turnstile=data.get('turnstile', default_turnstile),
+			turnstile_site_key=data.get('turnstile_site_key', default_turnstile_site_key),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -105,6 +113,21 @@ class AppConfig:
 				waf_cookie_names=['acw_tc'],
 				use_proxy=True,
 				persist_profile=False,
+			),
+			# 新版 NewAPI（GoRouter 等）：session/cookie 直连已废弃，
+			# 使用访问令牌（PAT）认证 + Turnstile 浏览器验证完成签到
+			'gorouter': ProviderConfig(
+				name='gorouter',
+				domain='https://gorouter.app',
+				login_path='/login',
+				sign_in_path='/api/user/checkin',
+				user_info_path='/api/user/self',
+				api_user_key='new-api-user',  # 新版前端不再发送该请求头，账号无 api_user 时不会附加
+				bypass_method=None,
+				waf_cookie_names=None,
+				use_proxy=False,
+				persist_profile=False,
+				turnstile=True,
 			),
 		}
 
@@ -155,6 +178,8 @@ class AccountConfig:
 	name: str | None = None
 	email: str | None = None
 	password: str | None = None
+	# 新版 NewAPI（GoRouter 等）的系统访问令牌，使用 Authorization: Bearer 认证
+	access_token: str | None = None
 
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
@@ -169,11 +194,16 @@ class AccountConfig:
 			name=name if name else None,
 			email=data.get('email'),
 			password=data.get('password'),
+			access_token=data.get('access_token'),
 		)
 
 	def has_login_credentials(self) -> bool:
 		"""是否配置了邮箱密码登录"""
 		return bool(self.email and self.password)
+
+	def has_access_token(self) -> bool:
+		"""是否配置了系统访问令牌（新版 NewAPI PAT 认证）"""
+		return bool(self.access_token)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -205,19 +235,22 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
-			if 'api_user' not in account_dict:
+			has_pat = bool(account_dict.get('access_token'))
+
+			if not has_pat and 'api_user' not in account_dict:
 				has_login = account_dict.get('email') and account_dict.get('password')
 				if not has_login:
 					print(
-						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password login can omit it'
+						f'ERROR: Account {i + 1} missing required field (api_user) - '
+						'only email+password login or access_token accounts can omit it'
 					)
 					return None
 
 			has_cookies = 'cookies' in account_dict and account_dict['cookies']
 			has_login = account_dict.get('email') and account_dict.get('password')
 
-			if not has_cookies and not has_login:
-				print(f'ERROR: Account {i + 1} must have either cookies or email+password')
+			if not has_cookies and not has_login and not has_pat:
+				print(f'ERROR: Account {i + 1} must have either cookies, email+password or access_token')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:
