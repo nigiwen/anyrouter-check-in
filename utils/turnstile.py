@@ -105,8 +105,18 @@ GET_WIDGET_RECT_JS = """
 		const r = f.getBoundingClientRect();
 		info.iframes.push({ src: (f.src || '').slice(0, 80), x: r.x, y: r.y, width: r.width, height: r.height });
 	}
-	for (const h of document.querySelectorAll('[id^="cf-chl-widget-"]')) {
+	// 宿主 div 与 _response 隐藏 input 都以 cf-chl-widget- 开头；
+	// 排除 input（零尺寸）和零尺寸元素，且容器内的（我们自己渲染的）优先
+	const hosts = Array.from(document.querySelectorAll('[id^="cf-chl-widget-"]')).filter(
+		(h) => !h.id.endsWith('_response')
+	);
+	hosts.sort(
+		(a, b) =>
+			(container && container.contains(b) ? 1 : 0) - (container && container.contains(a) ? 1 : 0)
+	);
+	for (const h of hosts) {
 		const r = h.getBoundingClientRect();
+		if (!r.width || !r.height) continue;
 		info.hostRects.push({ id: h.id.slice(0, 24), x: r.x, y: r.y, width: r.width, height: r.height });
 	}
 	return info;
